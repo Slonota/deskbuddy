@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeskBuddy installer</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: ui-monospace, Menlo, Consolas, monospace; background: #5c94fc; color: #fff;
+           text-align: center; padding: 48px 16px; text-shadow: 2px 2px 0 #000; }
+    h1 { font-size: 40px; letter-spacing: 2px; }
+    p { max-width: 520px; margin: 12px auto; line-height: 1.5; }
+    .brick { height: 32px; margin-top: 48px; background:
+      repeating-linear-gradient(90deg, #000 0 2px, transparent 2px 32px), #c84c0c; }
+  </style>
+</head>
+<body>
+  <h1>DESKBUDDY</h1>
+  <p>8-bit часы, погода (Open-Meteo) и календарь для ESP32 CYD 2.8".</p>
+  <p>Подключите плату по USB и нажмите кнопку. Нужен Chrome или Edge.</p>
+  <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
+  <p>После прошивки подключитесь к Wi-Fi «DeskBuddy-Setup», откройте 192.168.4.1 и выберите свою сеть и город.</p>
+  <div class="brick"></div>
+</body>
+</html>
