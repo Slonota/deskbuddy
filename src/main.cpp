@@ -21,7 +21,6 @@
 #include <time.h>
 
 // ---------- settings you may want to tweak ----------
-#define ROTATION 1                 // 1 or 3 (flip the screen 180 degrees)
 #define INVERT_COLORS false        // set true if colors look inverted on your board
 #define WEATHER_REFRESH_MS (15UL * 60UL * 1000UL)
 #define CAL_TIMEOUT_MS 30000UL     // calendar returns to clock after this
@@ -68,13 +67,20 @@ struct Wx {
   const char* label;
 };
 
-static Wx wxFor(int c) {
-  if (c == 0 || c == 1) return {SPR_SUN, "CLEAR"};
-  if (c == 2 || c == 3) return {SPR_CLOUD, "CLOUDY"};
-  if (c == 45 || c == 48) return {SPR_CLOUD, "FOG"};
-  if ((c >= 51 && c <= 67) || (c >= 80 && c <= 82)) return {SPR_RAIN, "RAIN"};
-  if ((c >= 71 && c <= 77) || c == 85 || c == 86) return {SPR_SNOW, "SNOW"};
-  if (c >= 95) return {SPR_STORM, "STORM"};
+// Conditions are short strings (clear, partly-cloudy, cloudy, overcast, light-rain,
+// rain, showers, snow, thunderstorm, ...). Open-Meteo WMO codes are converted to them
+// in wmoToCond(), so the renderer does not depend on the weather source.
+static Wx wxFor(const String& c, const String& ph) {
+  if (ph == "fog" || ph == "mist") return {SPR_CLOUD, "FOG"};
+  if (c == "clear") return {SPR_SUN, "CLEAR"};
+  if (c == "partly-cloudy") return {SPR_SUN, "FAIR"};
+  if (c == "cloudy") return {SPR_CLOUD, "CLOUDY"};
+  if (c == "overcast") return {SPR_CLOUD, "OVERCAST"};
+  if (c.indexOf("thunder") >= 0) return {SPR_STORM, "STORM"};
+  if (c == "hail") return {SPR_SNOW, "HAIL"};
+  if (c.indexOf("snow") >= 0) return {SPR_SNOW, "SNOW"};
+  if (c == "showers") return {SPR_RAIN, "SHOWER"};
+  if (c.indexOf("rain") >= 0) return {SPR_RAIN, "RAIN"};
   return {SPR_CLOUD, "-"};
 }
 
@@ -85,15 +91,22 @@ XPT2046_Touchscreen ts(33, 36);  // CS, IRQ
 Preferences prefs;
 WiFiManager wm;
 WiFiManagerParameter* pCity = nullptr;
+WiFiManagerParameter* pLat = nullptr;
+WiFiManagerParameter* pLon = nullptr;
+WiFiManagerParameter* pTz = nullptr;
+WiFiManagerParameter* pFlip = nullptr;
 
 String city, cityLabel;
 float lat = 0, lon = 0;
 long utcOffset = 0;
 bool haveOffset = false;
+bool manualCoords = false;  // true: lat/lon entered by hand, no geocoding
+String tzName;               // IANA name, e.g. Europe/Berlin; empty = auto by coordinates
+bool flipDisplay = false;    // true: screen rotated 180 degrees
 
 bool haveWeather = false;
 float temp = 0, tmax = 0, tmin = 0, wind = 0;
-int wcode = -1;
+String wcond, wphen;
 uint32_t lastWeatherTry = 0;
 
 int screenMode = 0;  // 0 clock, 1 calendar
@@ -102,6 +115,29 @@ int lastMin = -1, lastSec = -1, lastDay = -1;
 
 // ---------- helpers ----------
 static bool haveLoc() { return lat != 0 || lon != 0; }
+
+static void applyRotation() {
+  uint8_t r = flipDisplay ? 3 : 1;
+  tft.setRotation(r);
+  ts.setRotation(r);
+}
+
+static bool validTz(const String& v) {
+  if (v.length() > 40) return false;
+  for (size_t i = 0; i < v.length(); i++) {
+    char c = v[i];
+    if (!(isalnum((uint8_t)c) || c == '/' || c == '_' || c == '+' || c == '-')) return false;
+  }
+  return true;
+}
+
+static bool parseFlag(String v, bool def) {
+  v.trim();
+  v.toLowerCase();
+  if (v == "1" || v == "y" || v == "yes" || v == "true" || v == "on") return true;
+  if (v == "0" || v == "n" || v == "no" || v == "false" || v == "off") return false;
+  return def;
+}
 
 static String asciiUpper(const String& s) {
   String o;
@@ -200,27 +236,62 @@ static bool geocode() {
   return haveLoc();
 }
 
-static bool fetchWeather() {
-  if (WiFi.status() != WL_CONNECTED || !haveLoc()) return false;
-  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
-               "&longitude=" + String(lon, 4) +
-               "&current=temperature_2m,weather_code,wind_speed_10m"
-               "&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1";
-  JsonDocument doc;
-  if (!httpGetJson(url, doc)) return false;
-  JsonVariant cur = doc["current"];
-  if (cur.isNull()) return false;
-  temp = cur["temperature_2m"] | 0.0f;
-  wcode = cur["weather_code"] | -1;
-  wind = cur["wind_speed_10m"] | 0.0f;
-  tmax = doc["daily"]["temperature_2m_max"][0] | 0.0f;
-  tmin = doc["daily"]["temperature_2m_min"][0] | 0.0f;
-  long off = doc["utc_offset_seconds"] | 0L;
+static void applyUtcOffset(long off) {
   if (!haveOffset || off != utcOffset) {
+    if (off != utcOffset) prefs.putLong("off", off);
     utcOffset = off;
     haveOffset = true;
     configTime(utcOffset, 0, "pool.ntp.org", "time.google.com");
   }
+}
+
+static const char* wmoToCond(int c, const char*& phen) {
+  phen = "";
+  if (c == 0) return "clear";
+  if (c == 1) return "partly-cloudy";
+  if (c == 2) return "cloudy";
+  if (c == 3) return "overcast";
+  if (c == 45 || c == 48) {
+    phen = "fog";
+    return "overcast";
+  }
+  if (c >= 51 && c <= 57) return "light-rain";
+  if (c >= 61 && c <= 67) return "rain";
+  if (c >= 80 && c <= 82) return "showers";
+  if (c >= 71 && c <= 77) return "snow";
+  if (c == 85 || c == 86) return "snow-showers";
+  if (c >= 95) return "thunderstorm";
+  return "cloudy";
+}
+
+static bool fetchWeatherOpenMeteo() {
+  String base = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) +
+                "&longitude=" + String(lon, 4) +
+                "&current=temperature_2m,weather_code,wind_speed_10m"
+                "&daily=temperature_2m_max,temperature_2m_min&forecast_days=1&wind_speed_unit=ms&timezone=";
+  JsonDocument doc;
+  bool ok = httpGetJson(base + (tzName.isEmpty() ? String("auto") : urlEncode(tzName)), doc);
+  if (!ok && !tzName.isEmpty()) {  // unknown timezone name: fall back to automatic
+    doc.clear();
+    ok = httpGetJson(base + "auto", doc);
+  }
+  if (!ok) return false;
+  JsonVariant cur = doc["current"];
+  if (cur.isNull()) return false;
+  temp = cur["temperature_2m"] | 0.0f;
+  wind = cur["wind_speed_10m"] | 0.0f;
+  const char* ph = "";
+  wcond = wmoToCond(cur["weather_code"] | 0, ph);
+  wphen = ph;
+  tmax = doc["daily"]["temperature_2m_max"][0] | temp;
+  tmin = doc["daily"]["temperature_2m_min"][0] | temp;
+  applyUtcOffset(doc["utc_offset_seconds"] | 0L);
+  return true;
+}
+
+static bool fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED || !haveLoc()) return false;
+  if (!fetchWeatherOpenMeteo()) return false;
   haveWeather = true;
   return true;
 }
@@ -237,7 +308,7 @@ static void drawSetup() {
   shadowText("1. Join Wi-Fi:", 20, 80, 2, WHITE);
   shadowText("   DeskBuddy-Setup", 20, 104, 2, YEL);
   shadowText("2. Open 192.168.4.1", 20, 136, 2, WHITE);
-  shadowText("3. Choose Wi-Fi + city", 20, 160, 2, WHITE);
+  shadowText("3. Wi-Fi, city or coords", 20, 160, 2, WHITE);
 }
 
 static void showMsg(const char* a, const char* b) {
@@ -254,7 +325,7 @@ static void drawWeather() {
     shadowText("NO WEATHER DATA", 40, 140, 2, WHITE);
     return;
   }
-  Wx w = wxFor(wcode);
+  Wx w = wxFor(wcond, wphen);
   drawSprite(w.spr, 40, 124, 4);
   char b[24];
   snprintf(b, sizeof b, "%d\xF7"
@@ -372,13 +443,66 @@ static void redrawAll() {
 }
 
 // ---------- Wi-Fi / city setup ----------
-static void applyCityParam() {
+static bool parseCoord(String v, float lo, float hi, float& out) {
+  v.trim();
+  v.replace(',', '.');
+  if (v.isEmpty()) return false;
+  char* end = nullptr;
+  float x = strtof(v.c_str(), &end);
+  if (end == v.c_str() || *end != '\0' || x < lo || x > hi) return false;
+  out = x;
+  return true;
+}
+
+static String coordLabel() {
+  char b[24];
+  snprintf(b, sizeof b, "%.1f%c %.1f%c", fabsf(lat), lat >= 0 ? 'N' : 'S', fabsf(lon), lon >= 0 ? 'E' : 'W');
+  return String(b);
+}
+
+// Reads the portal fields. Valid latitude + longitude win over the city name.
+static void applySettings() {
+  // timezone (empty = auto)
+  String tz = pTz->getValue();
+  tz.trim();
+  if (!validTz(tz)) tz = tzName;
+  if (tz != tzName) {
+    tzName = tz;
+    prefs.putString("tz", tzName);
+    haveOffset = false;  // force time re-config on next weather fetch
+  }
+  // display flip
+  bool f = parseFlag(pFlip->getValue(), flipDisplay);
+  if (f != flipDisplay) {
+    flipDisplay = f;
+    prefs.putBool("flip", flipDisplay);
+    applyRotation();
+  }
+
   String c = pCity->getValue();
   c.trim();
-  if (c.length() && c != city) {
+  float la, lo;
+  bool okLat = parseCoord(pLat->getValue(), -90.0f, 90.0f, la);
+  bool okLon = parseCoord(pLon->getValue(), -180.0f, 180.0f, lo);
+  if (okLat && okLon) {
+    bool changed = !manualCoords || fabsf(la - lat) > 0.00001f || fabsf(lo - lon) > 0.00001f || c != city;
+    if (!changed) return;
+    manualCoords = true;
+    lat = la;
+    lon = lo;
+    city = c;
+    cityLabel = c.isEmpty() ? coordLabel() : asciiUpper(c);
+    prefs.putBool("manual", true);
+    prefs.putString("city", city);
+    prefs.putFloat("lat", lat);
+    prefs.putFloat("lon", lon);
+    prefs.putString("label", cityLabel);
+  } else if (c.length() && (c != city || manualCoords)) {
+    manualCoords = false;
     city = c;
     lat = lon = 0;
     cityLabel = "";
+    prefs.putBool("manual", false);
     prefs.putString("city", city);
     prefs.putFloat("lat", 0);
     prefs.putFloat("lon", 0);
@@ -390,7 +514,7 @@ static void runPortal() {
   drawSetup();
   wm.setConfigPortalTimeout(180);
   wm.startConfigPortal("DeskBuddy-Setup");
-  applyCityParam();
+  applySettings();
   ensureLocation();
   haveWeather = false;
   fetchWeather();
@@ -422,30 +546,45 @@ static void handleTouch() {
 void setup() {
   Serial.begin(115200);
   tft.init();
-  tft.setRotation(ROTATION);
   tft.invertDisplay(INVERT_COLORS);
   pinMode(21, OUTPUT);
   digitalWrite(21, HIGH);
   touchSPI.begin(25, 39, 32, 33);
   ts.begin(touchSPI);
-  ts.setRotation(ROTATION);
 
   prefs.begin("deskbuddy", false);
-  city = prefs.getString("city", "");
-  cityLabel = prefs.getString("label", "");
-  lat = prefs.getFloat("lat", 0);
-  lon = prefs.getFloat("lon", 0);
+  city = prefs.getString("city", "Saint Petersburg");
+  cityLabel = prefs.getString("label", "PETERSBURG");
+  lat = prefs.getFloat("lat", 59.9386f);
+  lon = prefs.getFloat("lon", 30.3141f);
+  manualCoords = prefs.getBool("manual", false);
+  tzName = prefs.getString("tz", "Europe/Moscow");
+  utcOffset = prefs.getLong("off", 10800);  // Moscow time until the first weather reply
+  flipDisplay = prefs.getBool("flip", false);
+  applyRotation();
 
   showMsg("DESKBUDDY", "Connecting...");
   WiFi.mode(WIFI_STA);
-  pCity = new WiFiManagerParameter("city", "City (e.g. Berlin)", city.c_str(), 40);
+  static WiFiManagerParameter hint(
+      "<p>Enter a city <b>or</b> latitude and longitude in decimal degrees "
+      "(e.g. 52.52 and 13.40). Coordinates take priority.</p>");
+  pCity = new WiFiManagerParameter("city", "City (optional with coordinates)", city.c_str(), 40);
+  pLat = new WiFiManagerParameter("lat", "Latitude (-90..90)", manualCoords ? String(lat, 5).c_str() : "", 12);
+  pLon = new WiFiManagerParameter("lon", "Longitude (-180..180)", manualCoords ? String(lon, 5).c_str() : "", 12);
+  wm.addParameter(&hint);
   wm.addParameter(pCity);
+  wm.addParameter(pLat);
+  wm.addParameter(pLon);
+  pTz = new WiFiManagerParameter("tz", "Timezone, empty = auto (e.g. Europe/Berlin)", tzName.c_str(), 40);
+  pFlip = new WiFiManagerParameter("flip", "Flip display 180 deg (0 = no, 1 = yes)", flipDisplay ? "1" : "0", 5);
+  wm.addParameter(pTz);
+  wm.addParameter(pFlip);
   wm.setAPCallback([](WiFiManager*) { drawSetup(); });
   wm.setConfigPortalTimeout(180);
   wm.setConnectTimeout(20);
   if (!wm.autoConnect("DeskBuddy-Setup")) ESP.restart();
-  applyCityParam();
-  if (city.isEmpty()) runPortal();
+  applySettings();
+  if (!haveLoc() && city.isEmpty()) runPortal();
 
   showMsg("DESKBUDDY", "Loading weather...");
   ensureLocation();
@@ -455,7 +594,7 @@ void setup() {
   }
   fetchWeather();
   lastWeatherTry = millis();
-  if (!haveOffset) configTime(0, 0, "pool.ntp.org", "time.google.com");
+  if (!haveOffset) configTime(utcOffset, 0, "pool.ntp.org", "time.google.com");
 
   uint32_t t0 = millis();
   while (time(nullptr) < 1700000000 && millis() - t0 < 10000) delay(200);
